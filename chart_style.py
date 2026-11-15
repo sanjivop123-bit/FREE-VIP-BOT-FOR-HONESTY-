@@ -1,7 +1,8 @@
 """Chart restyle (dark, TradingView-like, like the example photo) + /admin shortcut.
 
 Render Start Command:   python chart_style.py
-It loads run.py (and main-4.py) unchanged, then only replaces the chart drawing and adds /admin.
+It loads run.py (and main-4.py) unchanged, then only replaces the chart drawing, removes the
+warning line from signal messages, and adds /admin.
 """
 import struct
 import zlib
@@ -101,6 +102,17 @@ def render_chart(candles, direction, title="", tz_offset_min=0):
 
 
 run.render_chart = render_chart                 # run.py looks the function up by name, so this swaps it
+
+_orig_caption = run.build_caption
+
+
+def build_caption(*args, **kwargs):
+    """Same signal text, without the final 'Trade responsibly...' warning line."""
+    lines = _orig_caption(*args, **kwargs).split("\n")
+    return "\n".join(line for line in lines if not line.startswith("⚠️ Trade responsibly"))
+
+
+run.build_caption = build_caption
 
 _prev_build = run.bot_main.build_application
 
