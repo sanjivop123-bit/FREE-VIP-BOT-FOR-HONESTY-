@@ -289,19 +289,17 @@ async def send_signal(app, caption, png, only=None):
     return sent, len(ids)
 
 
+_orig_caption = run.build_caption          # the original message from run.py (analysis text etc. stays unchanged)
+
+
 def build_caption(pair, tf, res, entry_ts, aligned=False, test=False):
-    """Simple signal: header, asset, entry time, expiry, CALL/PUT, REGISTER link."""
-    local = datetime.fromtimestamp(entry_ts, timezone.utc).astimezone(
-        timezone(timedelta(minutes=run.UTC_OFFSET_MIN))).strftime("%H:%M:%S")
-    sig = "🟢 CALL" if res["direction"] == "CALL" else "🔴 PUT"
-    lines = (["🧪 TEST SIGNAL (only you can see this)"] if test else []) + [
-        html.escape(CFG["header"]), run.LINE,
-        f"📊 Asset: {html.escape(pair)}", f"⏰ Entry Time: {local}",
-        f"⏳ Expiry: {run._fmt_expiry(run.EXPIRY[tf])}", f"🎯 Signal: {sig}", run.LINE]
-    if CFG["disclaimer"]:
-        lines.append(html.escape(CFG["disclaimer"]))
-    lines.append(f'🔗 <a href="{html.escape(CFG["referral"], quote=True)}">REGISTER ON QUOTEX</a>')
-    return "\n".join(lines)
+    """Original signal message, only: header = your name, disclaimer + Timeframe lines removed, REGISTER link added at the bottom."""
+    text = _orig_caption(pair, tf, res, entry_ts, aligned=aligned, test=test)
+    text = text.replace("🔷 HONESTY AI VIP BOT", CFG["header"], 1)
+    lines = [ln for ln in text.split("\n")
+             if not ln.startswith(("⚠️ Trade responsibly", "⏱ Timeframe"))]
+    out = html.escape("\n".join(lines))
+    return out + f'\n🔗 <a href="{html.escape(CFG["referral"], quote=True)}">REGISTER ON QUOTEX</a>'
 
 
 run.send_signal = send_signal
