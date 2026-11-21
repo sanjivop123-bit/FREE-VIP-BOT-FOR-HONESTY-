@@ -15,6 +15,8 @@ import asyncio
 import html
 import importlib.util
 import json
+from decimal import Decimal
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -54,7 +56,7 @@ CFG = {"channel_id": None, "channel_title": "", "auto_forward": True, "last_forw
        "promo_on": True, "promo_hours": 5.0, "promo_text": DEFAULT_PROMO, "last_promo": 0.0,
        "referral": "https://broker-qx.pro/sign-up/?lid=2416000",
        "header": "❤️‍🔥 HONESTY TAMIL",
-       "disclaimer": "", "vals": {}}
+       "disclaimer": "", "strict": True, "min_deposit": 40, "vals": {}}
 
 
 # ----------------------------- persistence -----------------------------
@@ -178,6 +180,8 @@ SETTINGS = {
     "offset": ("Fetch delay after candle close (s)", "val", lambda: run.FETCH_OFFSET, _setrun("FETCH_OFFSET"), v_int(0, 30)),
     "align": ("Require 1M+5M trend alignment", "bool", lambda: run.REQUIRE_ALIGN, _setrun("REQUIRE_ALIGN"), None),
     "auto_forward": ("Auto-forward signals to channel", "bool", lambda: CFG["auto_forward"], _setkey(CFG, "auto_forward"), None),
+    "strict": ("Strict Trader ID check (postback)", "bool", lambda: CFG["strict"], _setkey(CFG, "strict"), None),
+    "min_deposit": ("Min deposit USD (used if MIN_DEPOSIT env is empty)", "val", lambda: CFG["min_deposit"], _setkey(CFG, "min_deposit"), v_float(1, 100000)),
     "promo_on": ("Promotional messages", "bool", lambda: CFG["promo_on"], _setkey(CFG, "promo_on"), None),
     "promo_hours": ("Promo interval (hours)", "val", lambda: CFG["promo_hours"], _setkey(CFG, "promo_hours"), v_float(1, 168)),
     "promo_text": ("Promo message (HTML)", "text", lambda: CFG["promo_text"], _setkey(CFG, "promo_text"), v_text(3500, "{referral}")),
@@ -292,14 +296,41 @@ async def send_signal(app, caption, png, only=None):
 _orig_caption = run.build_caption          # the original message from run.py (analysis text etc. stays unchanged)
 
 
+_FIELD_RE = re.compile(r"^\W*(Asset|Entry Time|Expiry|Signal|Analysis)\s*:\s*(.*)$")
+
+
+def _short_analysis(t):
+    """One short line built only from what the original analysis really says (no invented facts)."""
+    parts = []
+    if "EMA 9 is above EMA 21" in t:
+        parts.append("EMA 9 above EMA 21")
+    elif "EMA 9 is below EMA 21" in t:
+        parts.append("EMA 9 below EMA 21")
+    if "MACD momentum is rising" in t:
+        parts.append("MACD rising")
+    elif "MACD momentum is falling" in t:
+        parts.append("MACD falling")
+    m = re.search(r"RSI at (\d+)", t)
+    if m:
+        parts.append(f"RSI {m.group(1)}")
+    return ", ".join(parts) or t[:90]
+
+
 def build_caption(pair, tf, res, entry_ts, aligned=False, test=False):
-    """Original signal message, only: header = your name, disclaimer + Timeframe lines removed, REGISTER link added at the bottom."""
+    """Exactly 5 lines: Asset, Entry Time, Expiry, Signal, AI Analysis (no header, no strength, no disclaimer)."""
     text = _orig_caption(pair, tf, res, entry_ts, aligned=aligned, test=test)
-    text = text.replace("🔷 HONESTY AI VIP BOT", CFG["header"], 1)
-    lines = [ln for ln in text.split("\n")
-             if not ln.startswith(("⚠️ Trade responsibly", "⏱ Timeframe"))]
-    out = html.escape("\n".join(lines))
-    return out + f'\n🔗 <a href="{html.escape(CFG["referral"], quote=True)}">REGISTER ON QUOTEX</a>'
+    f = {}
+    for ln in text.split("\n"):
+        m = _FIELD_RE.match(ln)
+        if m and m.group(1) not in f:
+            f[m.group(1)] = m.group(2).strip()
+    if not all(k in f for k in ("Asset", "Entry Time", "Expiry", "Signal")):
+        return html.escape(text)                      # unknown layout: never lose a signal
+    lines = (["🧪 TEST SIGNAL (only you can see this)"] if test else []) + [
+        f"📊 Asset: {f['Asset']}", f"🕐 Entry Time: {f['Entry Time'].replace(' IST', '').strip()}",
+        f"⏳ Expiry: {f['Expiry']}", f"🎯 Signal: {f['Signal']}",
+        f"🧠 AI Analysis: {_short_analysis(f.get('Analysis', ''))}"]
+    return html.escape("\n".join(lines))
 
 
 run.send_signal = send_signal
@@ -634,6 +665,224 @@ async def cmd_stats(update, context):
     await update.effective_message.reply_text(await stats_text(context.application))
 
 
+# ----------------------------- delete Trader IDs (admin only, with confirmation) -----------------------------
+TID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def _tids(arg):
+    return ["99999", "12345"] if arg.lower() == "tests" else ([arg] if TID_RE.match(arg) else [])
+
+
+async def _del_counts(pool, ids):
+    ev = await pool.fetchval("SELECT count(*) FROM bot_events WHERE trader_id = ANY($1::text[])", ids)
+    sub = await pool.fetchval("SELECT count(*) FROM bot_submissions WHERE trader_id = ANY($1::text[])", ids)
+    return ev, sub
+
+
+@admin_only
+async def cmd_deltrader(update, context):
+    msg = update.effective_message
+    pool = run._pool(context.application)
+    ids = _tids(context.args[0].strip()) if context.args else []
+    if pool is None or not ids:
+        await msg.reply_text("Usage:\n/deltrader 96534641  (one Trader ID)\n/deltrader tests  (the fake test IDs 99999 and 12345)")
+        return
+    ev, sub = await _del_counts(pool, ids)
+    await msg.reply_text(
+        f"🗑 Delete Trader ID: {', '.join(ids)}\nPostback events: {ev}\nSubmissions/approvals: {sub}\n"
+        "This cannot be undone.",
+        reply_markup=kb([[("✅ Yes, delete", f"d:y:{context.args[0].strip()[:32]}"), ("❌ Cancel", "d:n:x")]]))
+
+
+async def on_del(update, context):
+    q, app = update.callback_query, context.application
+    if not adm(update, context):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    _, act, arg = q.data.split(":", 2)
+    if act != "y":
+        await q.answer("Cancelled.")
+        await edit_msg(q, "Cancelled. Nothing was deleted.", None)
+        return
+    pool, ids = run._pool(app), _tids(arg)
+    if pool is None or not ids:
+        await q.answer("Not possible.", show_alert=True)
+        return
+    try:
+        r1 = await pool.execute("DELETE FROM bot_events WHERE trader_id = ANY($1::text[])", ids)
+        r2 = await pool.execute("DELETE FROM bot_submissions WHERE trader_id = ANY($1::text[])", ids)
+    except Exception as exc:  # noqa: BLE001
+        await q.answer(f"Failed: {type(exc).__name__}", show_alert=True)
+        return
+    await q.answer("Deleted ✅")
+    await edit_msg(q, f"✅ Deleted Trader ID: {', '.join(ids)}\nEvents removed: {r1.split()[-1]}\n"
+                      f"Submissions removed: {r2.split()[-1]}", None)
+
+
+# ----------------------------- strict Trader ID check (uses the Quotex postback data) -----------------------------
+def min_deposit(settings):
+    v = settings.min_deposit_value
+    return v if v is not None else Decimal(str(CFG["min_deposit"]))
+
+
+async def real_summary(store, tid):
+    """Postback summary for a Trader ID, ignoring the fake test events (event_id starting with test / chk-)."""
+    pool = getattr(store, "_pool", None)
+    if pool is None:
+        return await store.trader_summary(tid)
+    r = await pool.fetchrow(
+        """SELECT count(*) AS n, coalesce(bool_or(kind='reg'), false) AS reg, coalesce(bool_or(kind='ftd'), false) AS ftd,
+                  coalesce(sum(amount) FILTER (WHERE kind IN ('ftd','dep')), 0) AS dep_total,
+                  count(*) FILTER (WHERE kind IN ('ftd','dep')) AS dep_n
+           FROM bot_events WHERE trader_id=$1 AND event_id NOT ILIKE 'test%' AND event_id NOT ILIKE 'chk-%'""", tid)
+    if not r or r["n"] == 0:
+        return None
+    return {"registered": r["reg"], "ftd": r["ftd"], "deposits": Decimal(r["dep_total"]),
+            "deposit_count": r["dep_n"], "events": r["n"]}
+
+
+_orig_try = bot_main.try_auto_approve
+_orig_submit = bot_main._submit
+
+
+async def strict_auto_approve(store, settings, trader_id):
+    if not CFG["strict"]:
+        return await _orig_try(store, settings, trader_id)
+    pending = await store.get_by_trader(trader_id)
+    if not pending or pending["status"] != "pending":
+        return None
+    summ = await real_summary(store, trader_id)
+    if not (summ and summ["deposit_count"] > 0 and summ["deposits"] >= min_deposit(settings)):
+        return None
+    return await store.decide(trader_id, "approved", 0)          # decided_by 0 = automatic
+
+
+async def strict_submit(update, context, raw):
+    if not CFG["strict"]:
+        return await _orig_submit(update, context, raw)
+    bd = context.application.bot_data
+    s, store, user, msg = bd["settings"], bd["store"], update.effective_user, update.effective_message
+    tid = (raw or "").strip()
+    mine = await store.get_by_user(user.id)
+    if not s.trader_id_re.match(tid) or (mine and mine["status"] in ("approved", "pending")):
+        return await _orig_submit(update, context, raw)           # bad format / already approved / already waiting
+    context.user_data.pop(bot_main.AWAITING, None)
+    if await real_summary(store, tid) is None:
+        await msg.reply_text("❌ This Trader ID was not found. Please register with our link first, "
+                             "then send your Trader ID again.\n" + CFG["referral"])
+        return
+    res = await bot_main.submit_trader_id(store, s, user.id, user.username, tid)
+    if res.code == "taken":
+        await msg.reply_text("This Trader ID is already linked to another Telegram account.")
+        return
+    if res.code != "submitted":
+        return await _orig_submit(update, context, raw)
+    done = await strict_auto_approve(store, s, tid)
+    if done:
+        await msg.reply_text(bot_main.approval_text(s, done))
+        await bot_main.notify_admins(context.bot, s, f"Auto-approved (verified by postback)\n{bot_main._admin_text(done)}")
+    else:
+        await msg.reply_text(f"✅ Trader ID found, but the minimum deposit of {min_deposit(s)} {s.currency} is not "
+                             "detected yet. Deposit and you will be approved automatically once it is confirmed.")
+
+
+bot_main.try_auto_approve = strict_auto_approve
+bot_main._submit = strict_submit
+
+
+# ----------------------------- /trader : list + approve / reject / unlink / delete -----------------------------
+TR_PAGE, TR_ICON = 8, {"approved": "✅", "pending": "⏳", "rejected": "⛔"}
+
+
+async def tr_list(app, page):
+    rows = await run._pool(app).fetch("SELECT trader_id, status, username FROM bot_submissions ORDER BY submitted_at DESC")
+    if not rows:
+        return "No Trader IDs yet.", None
+    pages = (len(rows) + TR_PAGE - 1) // TR_PAGE
+    page = max(0, min(page, pages - 1))
+    btn = [[(f"{TR_ICON.get(r['status'], '•')} {r['trader_id']}" + (f"  @{r['username']}" if r["username"] else ""),
+             f"tr:v:{r['trader_id']}")] for r in rows[page * TR_PAGE:(page + 1) * TR_PAGE]]
+    nav = ([("⬅️ Prev", f"tr:l:{page - 1}")] if page > 0 else []) + ([("➡️ Next", f"tr:l:{page + 1}")] if page < pages - 1 else [])
+    return (f"👤 TRADER IDs ({len(rows)}) - page {page + 1}/{pages}\n✅ approved  ⏳ pending  ⛔ rejected\nTap one to manage it.",
+            kb(btn + ([nav] if nav else [])))
+
+
+async def tr_detail(app, tid):
+    s, store = app.bot_data["settings"], app.bot_data["store"]
+    row = await run._pool(app).fetchrow("SELECT * FROM bot_submissions WHERE trader_id=$1", tid)
+    req = (f"Telegram request: {row['status']}\nTelegram ID: {row['telegram_id']}"
+           + (f"\nUsername: @{row['username']}" if row["username"] else "")) if row else "Telegram request: none"
+    rows = []
+    if row:
+        a = ([("✅ Approve", f"tr:a:{tid}")] if row["status"] != "approved" else []) + \
+            ([("⛔ Reject", f"tr:r:{tid}")] if row["status"] != "rejected" else [])
+        rows += ([a] if a else []) + [[("🔓 Unlink", f"tr:u:{tid}")]]
+    rows += [[("🗑 Delete", f"tr:d:{tid}")], [("⬅️ Back", "tr:l:0")]]
+    return f"Trader ID {tid}\n{req}\n{bot_main.describe_summary(s, await real_summary(store, tid))}", kb(rows)
+
+
+async def cmd_trader(update, context):
+    if not adm(update, context):
+        return                                    # the original /trader ignores non-admins as well
+    app = context.application
+    try:
+        if run._pool(app) is None:
+            await update.effective_message.reply_text("This needs PostgreSQL (DATABASE_URL).")
+        else:
+            tid = context.args[0].strip()[:32] if context.args else None
+            text, markup = await (tr_detail(app, tid) if tid else tr_list(app, 0))
+            await update.effective_message.reply_text(text, reply_markup=markup)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("/trader failed: %s", type(exc).__name__)
+        await update.effective_message.reply_text(f"Could not load Trader IDs ({type(exc).__name__}).")
+    raise ApplicationHandlerStop
+
+
+async def on_trader(update, context):
+    q, app = update.callback_query, context.application
+    if not adm(update, context):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    pool = run._pool(app)
+    if pool is None:
+        await q.answer("Needs PostgreSQL.", show_alert=True)
+        return
+    _, act, arg = q.data.split(":", 2)
+    s = app.bot_data["settings"]
+    try:
+        if act == "l":
+            text, markup = await tr_list(app, int(arg))
+        elif act == "v":
+            text, markup = await tr_detail(app, arg)
+        elif act in ("a", "r"):
+            status = "approved" if act == "a" else "rejected"
+            row = await pool.fetchrow("UPDATE bot_submissions SET status=$2, decided_at=now(), decided_by=$3 "
+                                      "WHERE trader_id=$1 RETURNING *", arg, status, q.from_user.id)
+            if row:
+                try:
+                    await app.bot.send_message(row["telegram_id"], bot_main.approval_text(s, row) if act == "a" else
+                                               f"Your Trader ID {arg} was not approved. Check it and submit again with /verify.")
+                except Exception:  # noqa: BLE001
+                    pass
+            text, markup = await tr_detail(app, arg)
+        elif act in ("u", "d"):
+            what = ("Unlink: removes the link to the Telegram user (they must verify again). Postback data is kept."
+                    if act == "u" else "Delete: removes the Telegram link AND all postback events of this ID.")
+            text, markup = f"⚠️ {what}\nTrader ID: {arg}\nThis cannot be undone.", \
+                kb([[("✅ Yes", f"tr:{act.upper()}:{arg}"), ("❌ Cancel", f"tr:v:{arg}")]])
+        else:                                          # "U" / "D" = confirmed
+            n_link = (await pool.execute("DELETE FROM bot_submissions WHERE trader_id=$1", arg)).split()[-1]
+            n_ev = (await pool.execute("DELETE FROM bot_events WHERE trader_id=$1", arg)).split()[-1] if act == "D" else None
+            text = (f"🗑 Deleted {arg}: {n_link} link, {n_ev} postback events." if n_ev is not None
+                    else f"🔓 Unlinked {arg}: {n_link} link removed.")
+            markup = kb([[("⬅️ Back to list", "tr:l:0")]])
+    except Exception as exc:  # noqa: BLE001
+        await q.answer(f"Failed: {type(exc).__name__}", show_alert=True)
+        return
+    await q.answer()
+    await edit_msg(q, text, markup)
+
+
 # ----------------------------- hooks into the bot -----------------------------
 async def master_boot(app):
     while app.bot_data.get("store") is None or not app.running:
@@ -659,9 +908,12 @@ def _build(settings, polling):
     app.add_handler(CallbackQueryHandler(on_fwd, pattern=r"^f:"))
     app.add_handler(CallbackQueryHandler(on_promo_now, pattern=r"^p:now$"))
     app.add_handler(CallbackQueryHandler(on_result, pattern=r"^r:"))
+    app.add_handler(CallbackQueryHandler(on_del, pattern=r"^d:"))
+    app.add_handler(CallbackQueryHandler(on_trader, pattern=r"^tr:"))
+    app.add_handler(CommandHandler("trader", cmd_trader), group=-1)   # replaces the old one-ID-only /trader for admins
     for name, fn in [("admin", panel_cmd("home")), ("edit", panel_cmd("edit")), ("forwardchannel", panel_cmd("fwd")),
                      ("assets", panel_cmd("assets")), ("cancel", cmd_cancel), ("restartengine", cmd_restart),
-                     ("scan", cmd_scan), ("signals", cmd_signals), ("stats", cmd_stats)]:
+                     ("scan", cmd_scan), ("deltrader", cmd_deltrader), ("signals", cmd_signals), ("stats", cmd_stats)]:
         app.add_handler(CommandHandler(name, fn))
     return app
 
