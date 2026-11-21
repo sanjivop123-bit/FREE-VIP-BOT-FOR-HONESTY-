@@ -24,6 +24,7 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KB, InputFile
 from telegram.error import RetryAfter, TelegramError
+from telegram.ext import ExtBot
 from telegram.ext import (ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, MessageHandler, filters)
 
 HERE = Path(__file__).resolve().parent
@@ -325,12 +326,12 @@ def build_caption(pair, tf, res, entry_ts, aligned=False, test=False):
         if m and m.group(1) not in f:
             f[m.group(1)] = m.group(2).strip()
     if not all(k in f for k in ("Asset", "Entry Time", "Expiry", "Signal")):
-        return html.escape(text)                      # unknown layout: never lose a signal
-    lines = (["🧪 TEST SIGNAL (only you can see this)"] if test else []) + [
+        return "<b>" + html.escape(text) + "</b>"     # unknown layout: never lose a signal
+    lines = (["🧪 TEST SIGNAL (only you can see this)"] if test else []) + [CFG["header"],
         f"📊 Asset: {f['Asset']}", f"🕐 Entry Time: {f['Entry Time'].replace(' IST', '').strip()}",
         f"⏳ Expiry: {f['Expiry']}", f"🎯 Signal: {f['Signal']}",
         f"🧠 AI Analysis: {_short_analysis(f.get('Analysis', ''))}"]
-    return html.escape("\n".join(lines))
+    return "<b>" + html.escape("\n".join(lines)) + "</b>"
 
 
 run.send_signal = send_signal
@@ -550,6 +551,7 @@ async def on_promo_now(update, context):
 async def on_text(update, context):
     key = context.user_data.get("await")
     if not key or not adm(update, context):
+        await member_text(update, context)
         return
     app, text = context.application, update.effective_message.text
     try:
@@ -757,6 +759,28 @@ async def strict_auto_approve(store, settings, trader_id):
     return await store.decide(trader_id, "approved", 0)          # decided_by 0 = automatic
 
 
+CONNECTED = "✅ Successfully your Trader ID is connected"
+
+
+def _usd(x):
+    return "$" + format(Decimal(x).quantize(Decimal("0.01")), "f")
+
+
+def _usd_min(x):
+    return "$" + format(Decimal(x).normalize(), "f")
+
+
+def menu_kb():
+    return KB([[B("▶️ Start Signals", callback_data="sig:start"), B("🔕 Stop Signals", callback_data="sig:stop")]])
+
+
+async def send_connected(app, uid):
+    """Connected message + Start/Stop buttons. Signals begin when the member taps Start Signals."""
+    await run.set_optout(app, uid, True)
+    vip = app.bot_data["settings"].vip_link
+    await app.bot.send_message(uid, CONNECTED + (f"\nVIP access: {vip}" if vip else ""), reply_markup=menu_kb())
+
+
 async def strict_submit(update, context, raw):
     if not CFG["strict"]:
         return await _orig_submit(update, context, raw)
@@ -764,26 +788,95 @@ async def strict_submit(update, context, raw):
     s, store, user, msg = bd["settings"], bd["store"], update.effective_user, update.effective_message
     tid = (raw or "").strip()
     mine = await store.get_by_user(user.id)
-    if not s.trader_id_re.match(tid) or (mine and mine["status"] in ("approved", "pending")):
-        return await _orig_submit(update, context, raw)           # bad format / already approved / already waiting
-    context.user_data.pop(bot_main.AWAITING, None)
-    if await real_summary(store, tid) is None:
-        await msg.reply_text("❌ This Trader ID was not found. Please register with our link first, "
-                             "then send your Trader ID again.\n" + CFG["referral"])
+    if mine and mine["status"] == "pending":
+        return await _orig_submit(update, context, raw)           # an old manual request: original reply
+    if mine and mine["status"] == "approved":
+        context.user_data.pop(bot_main.AWAITING, None)
+        await msg.reply_text(CONNECTED, reply_markup=menu_kb())
+        return
+    context.user_data[bot_main.AWAITING] = True                   # after a failed try the next message is a new try
+    summ = await real_summary(store, tid) if s.trader_id_re.match(tid) else None
+    if summ is None:
+        await msg.reply_text("❌ NOT FOUND")
+        return
+    need, have = min_deposit(s), summ["deposits"]
+    if not (summ["deposit_count"] > 0 and have >= need):
+        await msg.reply_text(f"✅ Trader ID found\n💰 Minimum Deposit: {_usd_min(need)}\n💳 Your Deposit: {_usd(have)}\n"
+                             f"➡️ Deposit minimum {_usd_min(need)}, then send your Trader ID again.")
         return
     res = await bot_main.submit_trader_id(store, s, user.id, user.username, tid)
     if res.code == "taken":
-        await msg.reply_text("This Trader ID is already linked to another Telegram account.")
+        await msg.reply_text("❌ This Trader ID is already linked to another Telegram account.")
         return
     if res.code != "submitted":
         return await _orig_submit(update, context, raw)
-    done = await strict_auto_approve(store, s, tid)
+    context.user_data.pop(bot_main.AWAITING, None)
+    done = await store.decide(tid, "approved", 0)                 # decided_by 0 = automatic
     if done:
-        await msg.reply_text(bot_main.approval_text(s, done))
+        await send_connected(context.application, user.id)
         await bot_main.notify_admins(context.bot, s, f"Auto-approved (verified by postback)\n{bot_main._admin_text(done)}")
-    else:
-        await msg.reply_text(f"✅ Trader ID found, but the minimum deposit of {min_deposit(s)} {s.currency} is not "
-                             "detected yet. Deposit and you will be approved automatically once it is confirmed.")
+
+
+async def member_text(update, context):
+    """Plain text from a member who is not editing anything: never show the old 'Use /verify ... /help' hint."""
+    if not CFG["strict"] or context.user_data.get(bot_main.AWAITING):
+        return                                    # strict off: original behaviour / waiting for a Trader ID: original handler
+    text = (update.effective_message.text or "").strip()
+    if re.fullmatch(r"\d{3,12}", text):
+        await strict_submit(update, context, text)   # a bare number is treated as a Trader ID
+    raise ApplicationHandlerStop                  # anything else: stay silent
+
+
+_orig_on_decision = bot_main.on_decision
+
+
+async def on_decision_wrap(update, context):
+    """Admin pressed Approve/Reject: original handler first, then the Start/Stop buttons for the member."""
+    await _orig_on_decision(update, context)
+    q = update.callback_query
+    try:
+        if q and (q.data or "").startswith("ok:"):
+            row = await context.application.bot_data["store"].get_by_trader(q.data.split(":", 1)[1])
+            at = row.get("decided_at") if row else None
+            if row and row["status"] == "approved" and at and (datetime.now(timezone.utc) - at).total_seconds() < 20:
+                await run.set_optout(context.application, row["telegram_id"], True)
+                await context.bot.send_message(row["telegram_id"], "🔔 SIGNALS", reply_markup=menu_kb())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("approve menu failed: %s", type(exc).__name__)
+    raise ApplicationHandlerStop
+
+
+bot_main.approval_text = lambda s, row: CONNECTED + (f"\nVIP access: {s.vip_link}" if s.vip_link else "")
+
+
+# ---- every normal bot message in bold ("dark" text). Telegram cannot change font or colour, only bold/italic/mono.
+def _unset(v):
+    return v is None or type(v).__name__ == "DefaultValue"
+
+
+_o_send_message, _o_send_photo = ExtBot.send_message, ExtBot.send_photo
+
+
+async def _bold_message(self, *a, **k):
+    text = k["text"] if "text" in k else (a[1] if len(a) > 1 else None)
+    if isinstance(text, str) and text and _unset(k.get("parse_mode")) and len(a) < 3 and not k.get("entities"):
+        wrapped = "<b>" + html.escape(text) + "</b>"
+        if "text" in k:
+            k["text"] = wrapped
+        else:
+            a = (a[0], wrapped) + tuple(a[2:])
+        k["parse_mode"] = "HTML"
+    return await _o_send_message(self, *a, **k)
+
+
+async def _bold_photo(self, *a, **k):
+    cap = k.get("caption")
+    if isinstance(cap, str) and cap and _unset(k.get("parse_mode")) and not k.get("caption_entities"):
+        k["caption"], k["parse_mode"] = "<b>" + html.escape(cap) + "</b>", "HTML"
+    return await _o_send_photo(self, *a, **k)
+
+
+ExtBot.send_message, ExtBot.send_photo = _bold_message, _bold_photo
 
 
 bot_main.try_auto_approve = strict_auto_approve
@@ -860,8 +953,10 @@ async def on_trader(update, context):
                                       "WHERE trader_id=$1 RETURNING *", arg, status, q.from_user.id)
             if row:
                 try:
-                    await app.bot.send_message(row["telegram_id"], bot_main.approval_text(s, row) if act == "a" else
-                                               f"Your Trader ID {arg} was not approved. Check it and submit again with /verify.")
+                    if act == "a":
+                        await send_connected(app, row["telegram_id"])
+                    else:
+                        await app.bot.send_message(row["telegram_id"], f"❌ NOT FOUND")
                 except Exception:  # noqa: BLE001
                     pass
             text, markup = await tr_detail(app, arg)
@@ -910,6 +1005,7 @@ def _build(settings, polling):
     app.add_handler(CallbackQueryHandler(on_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(on_del, pattern=r"^d:"))
     app.add_handler(CallbackQueryHandler(on_trader, pattern=r"^tr:"))
+    app.add_handler(CallbackQueryHandler(on_decision_wrap, pattern=r"^(ok|no):.{1,60}$"), group=-1)
     app.add_handler(CommandHandler("trader", cmd_trader), group=-1)   # replaces the old one-ID-only /trader for admins
     for name, fn in [("admin", panel_cmd("home")), ("edit", panel_cmd("edit")), ("forwardchannel", panel_cmd("fwd")),
                      ("assets", panel_cmd("assets")), ("cancel", cmd_cancel), ("restartengine", cmd_restart),
