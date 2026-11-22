@@ -55,7 +55,7 @@ DEFAULT_PROMO = """🔥 <b>WELCOME TO OUR ADVANCED SIGNAL COMMUNITY!</b>
 
 CFG = {"channel_id": None, "channel_title": "", "auto_forward": True, "last_forward": "never",
        "promo_on": True, "promo_hours": 5.0, "promo_text": DEFAULT_PROMO, "last_promo": 0.0,
-       "referral": "https://broker-qx.pro/sign-up/?lid=2416000",
+       "referral": "https://broker-qx.pro/sign-up/?lid=2432286",
        "header": "❤️‍🔥 HONESTY TAMIL",
        "disclaimer": "", "strict": True, "min_deposit": 40, "min_score": 70, "vals": {}}
 
@@ -852,6 +852,22 @@ bot_main.approval_text = lambda s, row: CONNECTED + (f"\nVIP access: {s.vip_link
 
 
 # ---- every normal bot message in bold ("dark" text). Telegram cannot change font or colour, only bold/italic/mono.
+NEW_REF = "https://broker-qx.pro/sign-up/?lid=2432286"
+_REF_RE = re.compile(r"https?://[\w.-]*qx[\w.-]*/sign-up/\?lid=\d+")
+
+
+def _ref(x):
+    """Every Quotex sign-up link in any outgoing text becomes the new referral link."""
+    return _REF_RE.sub(NEW_REF, x) if isinstance(x, str) else x
+
+
+def _ref_markup(rm):
+    rows = getattr(rm, "inline_keyboard", None)
+    if not rows or not any(getattr(b, "url", None) and _REF_RE.search(b.url) for r in rows for b in r):
+        return rm
+    return KB([[B(b.text, url=_ref(b.url)) if getattr(b, "url", None) else b for b in r] for r in rows])
+
+
 def _unset(v):
     return v is None or type(v).__name__ == "DefaultValue"
 
@@ -861,6 +877,14 @@ _o_send_message, _o_send_photo = ExtBot.send_message, ExtBot.send_photo
 
 async def _bold_message(self, *a, **k):
     text = k["text"] if "text" in k else (a[1] if len(a) > 1 else None)
+    if isinstance(text, str):
+        if "text" in k:
+            k["text"] = text = _ref(text)
+        else:
+            text = _ref(text)
+            a = (a[0], text) + tuple(a[2:])
+    if "reply_markup" in k:
+        k["reply_markup"] = _ref_markup(k["reply_markup"])
     if isinstance(text, str) and text and _unset(k.get("parse_mode")) and len(a) < 3 and not k.get("entities"):
         wrapped = "<b>" + html.escape(text) + "</b>"
         if "text" in k:
@@ -872,6 +896,10 @@ async def _bold_message(self, *a, **k):
 
 
 async def _bold_photo(self, *a, **k):
+    if isinstance(k.get("caption"), str):
+        k["caption"] = _ref(k["caption"])
+    if "reply_markup" in k:
+        k["reply_markup"] = _ref_markup(k["reply_markup"])
     cap = k.get("caption")
     if isinstance(cap, str) and cap and _unset(k.get("parse_mode")) and not k.get("caption_entities"):
         k["caption"], k["parse_mode"] = "<b>" + html.escape(cap) + "</b>", "HTML"
@@ -1222,6 +1250,9 @@ async def master_boot(app):
         await asyncio.sleep(2)
     await cfg_load(app)
     apply_saved()
+    if CFG.get("migr_ref") != 1:                   # one time: old referral link saved in the database -> new link
+        CFG["referral"], CFG["migr_ref"] = NEW_REF, 1
+        await cfg_save(app)
     if CFG.get("migr") != 4:                       # one time: only the 28 core forex pairs (earlier lists had pairs Quotex does not have)
         if not CFG.get("migr"):
             CFG["vals"]["cool1"] = 3
