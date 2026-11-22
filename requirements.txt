@@ -2,3 +2,4 @@
 # httpx and tornado are installed automatically by python-telegram-bot[webhooks].
 python-telegram-bot[webhooks]==21.6
 asyncpg==0.29.0
+otcharts>=0.6

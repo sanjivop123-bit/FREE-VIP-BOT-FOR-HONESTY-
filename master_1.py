@@ -15,6 +15,9 @@ import asyncio
 import html
 import importlib.util
 import json
+import math
+import os
+import threading
 from decimal import Decimal
 import re
 import sys
@@ -179,7 +182,6 @@ SETTINGS = {
     "header": ("Signal header", "text", lambda: CFG["header"], _setkey(CFG, "header"), v_text(60)),
     "min_score": ("Min analysis score (50-95)", "val", lambda: CFG["min_score"], _setkey(CFG, "min_score"), v_int(50, 95)),
     "cool1": ("Cooldown per pair (min)", "val", lambda: run.COOLDOWN_MIN["1min"], _setkey(run.COOLDOWN_MIN, "1min"), v_int(0, 240)),
-    "pairs": ("Enabled pairs (send ALL for every pair)", "val", lambda: ",".join(run.PAIRS), _setlist(run.PAIRS), v_pairs),
     "auto_forward": ("Auto-forward signals to channel", "bool", lambda: CFG["auto_forward"], _setkey(CFG, "auto_forward"), None),
     "strict": ("Strict Trader ID check (postback)", "bool", lambda: CFG["strict"], _setkey(CFG, "strict"), None),
     "min_deposit": ("Min deposit USD (used if MIN_DEPOSIT env is empty)", "val", lambda: CFG["min_deposit"], _setkey(CFG, "min_deposit"), v_float(1, 100000)),
@@ -429,8 +431,8 @@ async def render(app, key):
                 "A signal is sent only when the weighted score reaches the minimum and the 5M trend agrees."), \
             kb(edit_rows(["min_score"]) + [BACK])
     if key == "assets":
-        return (f"📊 ASSETS\nPairs ({len(run.PAIRS)}): {', '.join(run.PAIRS)}\n"
-                "Signals: 2 minutes (1M candles)\nData: Twelve Data."), kb(edit_rows(["pairs"]) + [BACK])
+        return (f"📊 ASSETS (OTC)\nPairs ({len(OTC['symbols'])}): {', '.join(otc_label(x) for x in OTC['symbols']) or OTC['status']}\n"
+                "Signals: 2 minutes (1M candles)\nData: OTCharts (Quotex OTC). The pairs are the ones your OTCharts key can read."), kb([BACK])
     if key == "edit":
         return "✏️ EDIT BOT SETTINGS\nTap a setting to change it. Changes apply immediately.", \
             kb(edit_rows(list(SETTINGS)) + [BACK])
@@ -1203,21 +1205,8 @@ def strong_evaluate(candles):
 
 
 async def td_candles(symbol, interval, give_up_at=None):
-    """Same as run.td_candles but 300 candles (still ONE credit) so the 5M trend can be built from the 1M data."""
-    await run.LIMITER.acquire(give_up_at)
-    resp = await run._http().get("https://api.twelvedata.com/time_series", params={
-        "symbol": symbol, "interval": interval, "outputsize": 300, "timezone": "UTC", "apikey": run.TD_KEY})
-    data = resp.json()
-    if data.get("status") == "error" or "values" not in data:
-        code = data.get("code")
-        if code == 429:
-            daily = "day" in str(data.get("message", "")).lower()
-            run.LIMITER.penalize(daily=daily)
-            raise run.RateLimited("daily budget" if daily else "per-minute limit")
-        raise RuntimeError(f"Twelve Data error code {code}")
-    return [{"t": datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
-             "o": float(v["open"]), "h": float(v["high"]), "l": float(v["low"]), "c": float(v["close"])}
-            for v in reversed(data["values"])]
+    """Twelve Data is not used any more (OTC data only, see the OTC section below): never calls the API."""
+    raise RuntimeError("Twelve Data is disabled")
 
 
 _o_safe_check = run.safe_check
@@ -1225,7 +1214,7 @@ _o_safe_check = run.safe_check
 
 async def safe_check(app, pair, tf, *a, **k):
     setup, note = await _o_safe_check(app, pair, tf, *a, **k)
-    if "error code 4" in note and "error code 429" not in note:      # symbol not available on this plan: stop asking for a day
+    if "OTC symbol not available" in note:      # symbol not available on this plan: stop asking for a day
         app.bot_data.setdefault("closed_until", {})[pair] = run._now() + 86400
     return setup, note
 
@@ -1240,8 +1229,237 @@ async def rotate_loop(app):
 
 
 run.evaluate, run.td_candles, run.safe_check = strong_evaluate, td_candles, safe_check
+run.TD_KEY = run.TD_KEY or "otcharts"             # Twelve Data is not used any more; keeps the old key check quiet
+run.PAIRS[:] = []                                 # no regular (Twelve Data) pairs at all
 run.TIMEFRAMES[:] = ["1min"]                       # only 2-minute signals (1M candles)
 run.EXPIRY["1min"], run.MIN_SCORE_TF["1min"], run.REQUIRE_ALIGN = 2, 4, False
+
+
+# ----------------------------- OTC market data (OTCharts) - separate from Twelve Data -----------------------------
+# OTC signals are calculated ONLY from OTC candles. Twelve Data keeps serving the regular pairs; the two are never mixed.
+try:
+    from otcharts import Client as _OtcClient
+except Exception:  # noqa: BLE001 - package not installed: OTC stays off, nothing else changes
+    _OtcClient = None
+
+OTC_KEY = os.environ.get("OTCHARTS_API_KEY", "").strip()
+try:
+    OTC_DAILY_REQ = max(1, int(os.environ.get("OTC_DAILY_REQ", "150") or 150))   # REST requests per day the bot may spend
+except ValueError:
+    OTC_DAILY_REQ = 150
+OTC_STREAM = os.environ.get("OTC_STREAM", "1").strip().lower() in {"1", "true", "yes", "on"}
+OTC = {"status": "off", "client": None, "symbols": [], "stream_sym": None, "stream": "off", "req_today": 0, "day": None,
+       "usage": "not read", "last": "-", "errors": 0}
+
+
+def otc_label(sym):
+    base = (sym[:-4] if sym.lower().endswith("_otc") else sym).upper()
+    return (f"{base[:3]}/{base[3:]}" if len(base) == 6 else base) + " (OTC)"
+
+
+def _to_dt(x):
+    if isinstance(x, datetime):
+        return x if x.tzinfo else x.replace(tzinfo=timezone.utc)
+    if isinstance(x, (int, float)):
+        v = float(x)
+        return datetime.fromtimestamp(v / 1000 if v > 1e11 else v, timezone.utc)
+    if isinstance(x, str):
+        t = x.strip().replace("Z", "+00:00")
+        try:
+            d = datetime.fromisoformat(t)
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return _to_dt(float(t))
+    raise ValueError("unusable time")
+
+
+def otc_bars(bars):
+    """OTCharts bars -> candle dicts (UTC). Invalid / duplicate bars are dropped, nothing is invented."""
+    out = {}
+    for b in bars:
+        try:
+            o, h, l, c = (float(getattr(b, k)) for k in ("open", "high", "low", "close"))
+            if not all(x == x and 0 < x < 1e12 for x in (o, h, l, c)) or h < max(o, c, l) or l > min(o, c, h):
+                continue
+            t = _to_dt(b.time)
+            out[t] = {"t": t, "o": o, "h": h, "l": l, "c": c}
+        except Exception:  # noqa: BLE001
+            continue
+    return [out[k] for k in sorted(out)]
+
+
+def otc_spend():
+    today = datetime.now(timezone.utc).date()
+    if OTC["day"] != today:
+        OTC["day"], OTC["req_today"] = today, 0
+    if OTC["req_today"] >= OTC_DAILY_REQ:
+        return False
+    OTC["req_today"] += 1
+    return True
+
+
+class TickCandles:
+    """Builds 1-minute candles from live ticks (arrival time, UTC). Minutes without ticks produce no candle."""
+
+    def __init__(self, hist):
+        self.hist, self.cur = hist, None
+
+    def add(self, ts, price):
+        m, closed = int(ts // 60), None
+        if self.cur and self.cur["m"] != m:
+            c = self.cur
+            t = datetime.fromtimestamp(c["m"] * 60, timezone.utc)
+            if not self.hist or t > self.hist[-1]["t"]:
+                closed = {"t": t, "o": c["o"], "h": c["h"], "l": c["l"], "c": c["c"]}
+                self.hist.append(closed)
+                del self.hist[:-400]
+            self.cur = None
+        if self.cur is None:
+            self.cur = {"m": m, "o": price, "h": price, "l": price, "c": price}
+        else:
+            self.cur["h"], self.cur["l"], self.cur["c"] = max(self.cur["h"], price), min(self.cur["l"], price), price
+        return closed
+
+
+async def otc_signal(app, sym, candles):
+    """Analyse the newest CLOSED OTC candle and queue a signal (same chart / message / users as the other signals)."""
+    pair, d, now = otc_label(sym), app.bot_data, run._now()
+    closed = run.closed_only(candles, 60, now)
+    if len(closed) < 120:
+        return f"only {len(closed)} closed candles"
+    t_ts = int(closed[-1]["t"].timestamp())
+    if now - (t_ts + 60) > 75:
+        return "stale data (market quiet or feed late)"
+    seen = d.setdefault("seen", {})
+    if seen.get((pair, "1min")) == t_ts:
+        return "candle already analysed"
+    seen[(pair, "1min")] = t_ts
+    res = strong_evaluate(closed)
+    if res is None:
+        return "not enough data"
+    if abs(res["score"]) < run.MIN_SCORE_TF["1min"]:
+        return f"no setup (strength {res.get('strength')})"
+    if now - d.setdefault("cool", {}).get((pair, "1min"), 0) < run.COOLDOWN_MIN["1min"] * 60:
+        return "cooldown"
+    await run.dispatch(app, {**res, "pair": pair, "tf": "1min", "t": t_ts, "candles": closed, "aligned": False})
+    return f"-> {res['direction']}"
+
+
+async def otc_rest_loop(app):
+    """Round-robin over the OTC pairs, spending at most OTC_DAILY_REQ requests a day (one scan right after a minute closes)."""
+    i, cl = 0, OTC["client"]
+    while True:
+        await asyncio.sleep(60 - (time.time() % 60) + 3)
+        if not app.bot_data.get("auto_on"):
+            continue
+        if int(time.time() // 60) % max(1, round(1440 / OTC_DAILY_REQ)):
+            continue
+        syms = [x for x in OTC["symbols"] if x != OTC["stream_sym"]] or OTC["symbols"]
+        if not syms or not otc_spend():
+            continue
+        sym = syms[i % len(syms)]
+        i += 1
+        try:
+            bars = await asyncio.to_thread(lambda: cl.candles("quotex", sym, tf=60, limit=300))
+            note = await otc_signal(app, sym, otc_bars(bars))
+        except Exception as exc:  # noqa: BLE001
+            OTC["errors"] += 1
+            note = f"error {type(exc).__name__}"
+        OTC["last"] = f"{otc_label(sym)}: {note}"
+
+
+async def otc_stream_loop(app):
+    """One live stream (the plan allows one connection): the pair is analysed on every closed minute with no REST requests."""
+    cl, sym, loop = OTC["client"], OTC["stream_sym"], asyncio.get_running_loop()
+    ticks, stop = asyncio.Queue(maxsize=5000), threading.Event()
+
+    def push(item):
+        try:
+            ticks.put_nowait(item)
+        except asyncio.QueueFull:
+            pass
+
+    def reader():                                   # blocking client -> runs in its own thread, reconnects by itself
+        while not stop.is_set():
+            try:
+                for tick in cl.stream("quotex", sym):
+                    if stop.is_set():
+                        return
+                    loop.call_soon_threadsafe(push, (time.time(), float(tick.price)))
+            except Exception:  # noqa: BLE001
+                OTC["errors"] += 1
+            OTC["stream"] = "reconnecting"
+            stop.wait(5)
+
+    async def seed():
+        if not otc_spend():
+            return []
+        bars = await asyncio.to_thread(lambda: cl.candles("quotex", sym, tf=60, limit=300))
+        return run.closed_only(otc_bars(bars), 60, run._now())
+
+    try:
+        tc = TickCandles(await seed())
+        threading.Thread(target=reader, daemon=True, name="otc-stream").start()
+        OTC["stream"] = f"ON ({otc_label(sym)})"
+        while True:
+            try:
+                ts, price = await asyncio.wait_for(ticks.get(), 120)
+            except asyncio.TimeoutError:
+                OTC["stream"] = "no ticks for 2 min"
+                continue
+            OTC["stream"] = f"ON ({otc_label(sym)})"
+            done = tc.add(ts, price)
+            if done and app.bot_data.get("auto_on"):
+                if len(tc.hist) >= 2 and (tc.hist[-1]["t"] - tc.hist[-2]["t"]).total_seconds() > 120:
+                    tc.hist[:] = await seed() or tc.hist            # gap in the feed: rebuild the history from real candles
+                OTC["last"] = f"{otc_label(sym)}: {await otc_signal(app, sym, list(tc.hist))}"
+    finally:
+        stop.set()
+
+
+async def otc_boot(app):
+    if _OtcClient is None:
+        OTC["status"] = "package otcharts not installed (add it to requirements.txt)"
+        return
+    if not OTC_KEY:
+        OTC["status"] = "OTCHARTS_API_KEY not set"
+        return
+    try:
+        cl = _OtcClient()                           # reads OTCHARTS_API_KEY from the environment (documented)
+        syms = await asyncio.to_thread(lambda: [x.symbol for x in cl.symbols("quotex")])
+        if not syms:
+            OTC["status"] = "no OTC symbols available for this key"
+            return
+        try:
+            u = await asyncio.to_thread(cl.usage)
+            OTC["usage"] = f"{getattr(u, 'remaining', '?')} left of {getattr(u, 'quota_per', '?')}"
+        except Exception:  # noqa: BLE001
+            OTC["usage"] = "unavailable"
+    except Exception as exc:  # noqa: BLE001
+        OTC["status"] = f"failed: {type(exc).__name__}"
+        log.warning("OTC data start failed: %s", type(exc).__name__)       # type only: never log keys
+        return
+    pref = os.environ.get("OTC_STREAM_SYMBOL", "").strip()
+    OTC.update(client=cl, symbols=syms, status="ON", stream_sym=(pref if pref in syms else syms[0]) if OTC_STREAM else None)
+    loop = asyncio.get_running_loop()
+    app.bot_data["otc_tasks"] = [loop.create_task(run._forever("otc-rest", otc_rest_loop, app))]
+    if OTC["stream_sym"]:
+        app.bot_data["otc_tasks"].append(loop.create_task(run._forever("otc-stream", otc_stream_loop, app)))
+    log.info("OTC data ready: %d pairs | stream %s | up to %d REST requests/day", len(syms), OTC["stream_sym"] or "off", OTC_DAILY_REQ)
+
+
+def otc_status_text():
+    if OTC["status"] != "ON":
+        return f"\n🛰 OTC data: {OTC['status']}"
+    return (f"\n🛰 OTC data (OTCharts): ON | {len(OTC['symbols'])} pairs | stream {OTC['stream']} | "
+            f"REST today {OTC['req_today']}/{OTC_DAILY_REQ} | quota {OTC['usage']} | errors {OTC['errors']} | last: {OTC['last']}")
+
+
+_orig_status_all = status_all
+
+
+async def status_all(app):
+    return await _orig_status_all(app) + otc_status_text()
 
 
 # ----------------------------- hooks into the bot -----------------------------
@@ -1253,13 +1471,7 @@ async def master_boot(app):
     if CFG.get("migr_ref") != 1:                   # one time: old referral link saved in the database -> new link
         CFG["referral"], CFG["migr_ref"] = NEW_REF, 1
         await cfg_save(app)
-    if CFG.get("migr") != 4:                       # one time: only the 28 core forex pairs (earlier lists had pairs Quotex does not have)
-        if not CFG.get("migr"):
-            CFG["vals"]["cool1"] = 3
-            SETTINGS["cool1"][3](3)
-        CFG["vals"]["pairs"], CFG["migr"] = list(ALL_PAIRS), 4
-        SETTINGS["pairs"][3](CFG["vals"]["pairs"])
-        await cfg_save(app)
+    app.bot_data["otc_boot"] = asyncio.get_running_loop().create_task(otc_boot(app))     # OTC data: stream + paced REST
     app.bot_data["rotate_task"] = asyncio.get_running_loop().create_task(run._forever("rotate", rotate_loop, app))
     app.bot_data["master_task"] = asyncio.get_running_loop().create_task(run._forever("promo", promo_loop, app))
     log.info("master upgrade ready | channel %s | promo %s every %sh",
