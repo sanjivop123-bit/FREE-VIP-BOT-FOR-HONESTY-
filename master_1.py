@@ -57,7 +57,7 @@ CFG = {"channel_id": None, "channel_title": "", "auto_forward": True, "last_forw
        "promo_on": True, "promo_hours": 5.0, "promo_text": DEFAULT_PROMO, "last_promo": 0.0,
        "referral": "https://broker-qx.pro/sign-up/?lid=2416000",
        "header": "❤️‍🔥 HONESTY TAMIL",
-       "disclaimer": "", "strict": True, "min_deposit": 40, "vals": {}}
+       "disclaimer": "", "strict": True, "min_deposit": 40, "min_score": 70, "vals": {}}
 
 
 # ----------------------------- persistence -----------------------------
@@ -139,10 +139,18 @@ def v_url(s):
     return s
 
 
+ALL_PAIRS = ("EUR/USD GBP/USD USD/JPY USD/CHF USD/CAD AUD/USD NZD/USD EUR/GBP EUR/JPY EUR/CHF EUR/CAD EUR/AUD EUR/NZD "
+             "GBP/JPY GBP/CHF GBP/CAD GBP/AUD GBP/NZD AUD/JPY AUD/CHF AUD/CAD AUD/NZD CAD/JPY CAD/CHF CHF/JPY NZD/JPY NZD/CAD "
+             "NZD/CHF USD/MXN USD/ZAR USD/BRL USD/INR USD/TRY USD/SGD USD/HKD USD/NOK USD/SEK USD/PLN "
+             "BTC/USD ETH/USD LTC/USD XRP/USD SOL/USD ADA/USD BNB/USD DOT/USD XAU/USD XAG/USD").split()
+
+
 def v_pairs(s):
+    if s.strip().upper() == "ALL":
+        return list(ALL_PAIRS)
     p = run._pairs(s)
-    if not p or len(p) > 20:
-        raise ValueError("Send 1-20 pairs like: EUR/USD,GBP/USD,USD/JPY")
+    if not p or len(p) > 120:
+        raise ValueError("Send ALL, or pairs like: EUR/USD,GBP/USD,BTC/USD")
     return p
 
 
@@ -170,16 +178,9 @@ def _setlist(lst):
 # key: (label, kind, getter, setter, validator)    kind: val | text | bool
 SETTINGS = {
     "header": ("Signal header", "text", lambda: CFG["header"], _setkey(CFG, "header"), v_text(60)),
-    "min1": ("Min score 1M (1-5)", "val", lambda: run.MIN_SCORE_TF["1min"], _setkey(run.MIN_SCORE_TF, "1min"), v_int(1, 5)),
-    "min5": ("Min score 5M (1-5)", "val", lambda: run.MIN_SCORE_TF["5min"], _setkey(run.MIN_SCORE_TF, "5min"), v_int(1, 5)),
-    "cool1": ("Cooldown 1M (min)", "val", lambda: run.COOLDOWN_MIN["1min"], _setkey(run.COOLDOWN_MIN, "1min"), v_int(0, 240)),
-    "cool5": ("Cooldown 5M (min)", "val", lambda: run.COOLDOWN_MIN["5min"], _setkey(run.COOLDOWN_MIN, "5min"), v_int(0, 240)),
-    "exp1": ("Expiry 1M signals (min)", "val", lambda: run.EXPIRY["1min"], _setkey(run.EXPIRY, "1min"), v_int(1, 30)),
-    "exp5": ("Expiry 5M signals (min)", "val", lambda: run.EXPIRY["5min"], _setkey(run.EXPIRY, "5min"), v_int(1, 60)),
-    "pairs": ("Enabled pairs", "val", lambda: ",".join(run.PAIRS), _setlist(run.PAIRS), v_pairs),
-    "tfs": ("Timeframes", "val", lambda: ",".join(run.TF_LABEL[t] for t in run.TIMEFRAMES), _setlist(run.TIMEFRAMES), v_tfs),
-    "offset": ("Fetch delay after candle close (s)", "val", lambda: run.FETCH_OFFSET, _setrun("FETCH_OFFSET"), v_int(0, 30)),
-    "align": ("Require 1M+5M trend alignment", "bool", lambda: run.REQUIRE_ALIGN, _setrun("REQUIRE_ALIGN"), None),
+    "min_score": ("Min analysis score (50-95)", "val", lambda: CFG["min_score"], _setkey(CFG, "min_score"), v_int(50, 95)),
+    "cool1": ("Cooldown per pair (min)", "val", lambda: run.COOLDOWN_MIN["1min"], _setkey(run.COOLDOWN_MIN, "1min"), v_int(0, 240)),
+    "pairs": ("Enabled pairs (send ALL for every pair)", "val", lambda: ",".join(run.PAIRS), _setlist(run.PAIRS), v_pairs),
     "auto_forward": ("Auto-forward signals to channel", "bool", lambda: CFG["auto_forward"], _setkey(CFG, "auto_forward"), None),
     "strict": ("Strict Trader ID check (postback)", "bool", lambda: CFG["strict"], _setkey(CFG, "strict"), None),
     "min_deposit": ("Min deposit USD (used if MIN_DEPOSIT env is empty)", "val", lambda: CFG["min_deposit"], _setkey(CFG, "min_deposit"), v_float(1, 100000)),
@@ -301,7 +302,9 @@ _FIELD_RE = re.compile(r"^\W*(Asset|Entry Time|Expiry|Signal|Analysis)\s*:\s*(.*
 
 
 def _short_analysis(t):
-    """One short line built only from what the original analysis really says (no invented facts)."""
+    """One short line built only from what the analysis really found (no invented facts)."""
+    if t.startswith("SHORT:"):
+        return t[6:].strip()
     parts = []
     if "EMA 9 is above EMA 21" in t:
         parts.append("EMA 9 above EMA 21")
@@ -422,13 +425,13 @@ async def render(app, key):
         rows = [[(b.text, b.callback_data) for b in r] for r in run.ENGINE_KB.inline_keyboard]
         return await status_all(app), kb(rows + [BACK])
     if key == "ai":
-        return ("🧠 ANALYSIS SETTINGS\nIndicators used (real candle data): EMA 9/21, RSI 14, MACD, candle structure, "
-                "flat-market filter, 1M+5M alignment.\nA signal is sent only when enough confirmations agree "
-                "(score out of 5)."), kb(edit_rows(["min1", "min5", "align"]) + [BACK])
+        return ("🧠 ANALYSIS SETTINGS\n2-minute signals only. Checked on every closed candle: EMA 9/21/50, RSI, MACD, "
+                "Stochastic, ADX/DI, Supertrend, Bollinger, support/resistance, candle patterns, 5M trend.\n"
+                "A signal is sent only when the weighted score reaches the minimum and the 5M trend agrees."), \
+            kb(edit_rows(["min_score"]) + [BACK])
     if key == "assets":
         return (f"📊 ASSETS\nPairs ({len(run.PAIRS)}): {', '.join(run.PAIRS)}\n"
-                f"Timeframes: {SETTINGS['tfs'][2]()}\nData: Twelve Data (regular forex pairs only)."), \
-            kb(edit_rows(["pairs", "tfs"]) + [BACK])
+                "Signals: 2 minutes (1M candles)\nData: Twelve Data."), kb(edit_rows(["pairs"]) + [BACK])
     if key == "edit":
         return "✏️ EDIT BOT SETTINGS\nTap a setting to change it. Changes apply immediately.", \
             kb(edit_rows(list(SETTINGS)) + [BACK])
@@ -978,12 +981,254 @@ async def on_trader(update, context):
     await edit_msg(q, text, markup)
 
 
+# ----------------------------- strong 2-minute analysis (replaces the simple 5-point check) -----------------------------
+def _atr(c, n=14):
+    trs = [max(x["h"] - x["l"], abs(x["h"] - p["c"]), abs(x["l"] - p["c"])) for p, x in zip(c, c[1:])]
+    if len(trs) < n:
+        return None
+    a = sum(trs[:n]) / n
+    for t in trs[n:]:
+        a = (a * (n - 1) + t) / n
+    return a
+
+
+def _adx(c, n=14):
+    if len(c) < 2 * n + 2:
+        return None
+    tr, pdm, ndm = [], [], []
+    for p, x in zip(c, c[1:]):
+        up, dn = x["h"] - p["h"], p["l"] - x["l"]
+        pdm.append(up if up > dn and up > 0 else 0.0)
+        ndm.append(dn if dn > up and dn > 0 else 0.0)
+        tr.append(max(x["h"] - x["l"], abs(x["h"] - p["c"]), abs(x["l"] - p["c"])))
+    atr, pd, nd, dxs = sum(tr[:n]), sum(pdm[:n]), sum(ndm[:n]), []
+    for i in range(n, len(tr)):
+        atr, pd, nd = atr - atr / n + tr[i], pd - pd / n + pdm[i], nd - nd / n + ndm[i]
+        pdi, ndi = (100 * pd / atr, 100 * nd / atr) if atr else (0.0, 0.0)
+        dxs.append((100 * abs(pdi - ndi) / (pdi + ndi) if pdi + ndi else 0.0, pdi, ndi))
+    if len(dxs) < n:
+        return None
+    adx = sum(d[0] for d in dxs[:n]) / n
+    for d in dxs[n:]:
+        adx = (adx * (n - 1) + d[0]) / n
+    return adx, dxs[-1][1], dxs[-1][2]
+
+
+def _stoch(c, k=14, d=3):
+    if len(c) < k + d:
+        return None
+    ks = []
+    for i in range(k - 1, len(c)):
+        w = c[i - k + 1:i + 1]
+        hh, ll = max(x["h"] for x in w), min(x["l"] for x in w)
+        ks.append(100 * (c[i]["c"] - ll) / (hh - ll) if hh > ll else 50.0)
+    return ks[-1], sum(ks[-d:]) / d
+
+
+def _boll(closes, n=20, k=2.0):
+    w = closes[-n:]
+    m = sum(w) / n
+    sd = (sum((x - m) ** 2 for x in w) / n) ** 0.5
+    return m, m + k * sd, m - k * sd
+
+
+def _supertrend(c, n=10, mult=3.0):
+    if len(c) < n + 3:
+        return None
+    trs = [max(x["h"] - x["l"], abs(x["h"] - p["c"]), abs(x["l"] - p["c"])) for p, x in zip(c, c[1:])]
+    atr = sum(trs[:n]) / n                     # atr for candle index n
+    fub = flb = None
+    trend = 1
+    for i in range(n, len(c)):
+        if i > n:
+            atr = (atr * (n - 1) + trs[i - 1]) / n
+        hl2 = (c[i]["h"] + c[i]["l"]) / 2
+        ub, lb = hl2 + mult * atr, hl2 - mult * atr
+        if fub is None:
+            fub, flb, trend = ub, lb, (1 if c[i]["c"] > hl2 else -1)
+            continue
+        fub = ub if (ub < fub or c[i - 1]["c"] > fub) else fub
+        flb = lb if (lb > flb or c[i - 1]["c"] < flb) else flb
+        if trend == 1 and c[i]["c"] < flb:
+            trend = -1
+        elif trend == -1 and c[i]["c"] > fub:
+            trend = 1
+    return trend
+
+
+def _sr_room(c):
+    """Distance from the last close up to the nearest swing high and down to the nearest swing low."""
+    last, look, res, sup = c[-1]["c"], c[-90:-2], [], []
+    for i in range(2, len(look) - 2):
+        w = look[i - 2:i + 3]
+        if look[i]["h"] >= max(x["h"] for x in w):
+            res.append(look[i]["h"])
+        if look[i]["l"] <= min(x["l"] for x in w):
+            sup.append(look[i]["l"])
+    above, below = [r for r in res if r > last], [x for x in sup if x < last]
+    return (min(above) - last if above else None), (last - max(below) if below else None)
+
+
+def _pattern(c):
+    a, b = c[-2], c[-1]
+    body = lambda x: abs(x["c"] - x["o"])
+    rng = lambda x: (x["h"] - x["l"]) or 1e-12
+    up = lambda x: x["c"] > x["o"]
+    v = 0.0
+    if not up(a) and up(b) and b["c"] >= a["o"] and b["o"] <= a["c"] and body(b) > body(a):
+        v += 1.0                                           # bullish engulfing
+    if up(a) and not up(b) and b["o"] >= a["c"] and b["c"] <= a["o"] and body(b) > body(a):
+        v -= 1.0                                           # bearish engulfing
+    lw, uw = min(b["o"], b["c"]) - b["l"], b["h"] - max(b["o"], b["c"])
+    if body(b) > 0 and lw >= 2 * body(b) and uw <= body(b):
+        v += 0.7                                           # hammer / pin bar
+    if body(b) > 0 and uw >= 2 * body(b) and lw <= body(b):
+        v -= 0.7                                           # shooting star
+    if body(b) / rng(b) >= 0.7:
+        v += 0.5 if up(b) else -0.5                        # strong full-body candle
+    return max(-1.0, min(1.0, v))
+
+
+def _resample5(c):
+    out, cur, key = [], None, None
+    for x in c:
+        k = int(x["t"].timestamp() // 300)
+        if k != key:
+            if cur and cur["n"] == 5:
+                out.append(cur)
+            cur, key = {"o": x["o"], "h": x["h"], "l": x["l"], "c": x["c"], "n": 1}, k
+        else:
+            cur["h"], cur["l"], cur["c"] = max(cur["h"], x["h"]), min(cur["l"], x["l"]), x["c"]
+            cur["n"] += 1
+    if cur and cur["n"] == 5:
+        out.append(cur)
+    return out
+
+
+def _clamp(x, lo=-1.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def strong_evaluate(candles):
+    """Weighted vote of 10 independent checks (0-100). Returns the same dict shape as run.evaluate():
+    score = +-5 / +-4 when strong enough, 0 when rejected."""
+    if len(candles) < 120:
+        return None
+    closes = [x["c"] for x in candles]
+    price = closes[-1]
+    atr = _atr(candles)
+    e9, e21, e50 = run._ema(closes, 9)[-1], run._ema(closes, 21)[-1], run._ema(closes, 50)[-1]
+    r, rp = run._rsi(closes), run._rsi(closes[:-1])
+    h, hp = run._macd_hist(closes), run._macd_hist(closes[:-1])
+    st, ad, bb, sr = _stoch(candles), _adx(candles), _boll(closes), _sr_room(candles)
+    sup = _supertrend(candles)
+    c5 = _resample5(candles)
+    if None in (atr, r, rp, h, hp, st, ad, sup) or len(c5) < 30 or not price:
+        return None
+    k5 = [x["c"] for x in c5]
+    t5 = run._ema(k5, 9)[-1], run._ema(k5, 21)[-1], k5[-1]
+    v5 = 1.0 if (t5[0] > t5[1] and t5[2] > t5[1]) else -1.0 if (t5[0] < t5[1] and t5[2] < t5[1]) else 0.0
+    adx, pdi, ndi = ad
+    kk, dd = st
+    mid, upb, lob = bb
+    pb = (price - lob) / (upb - lob) if upb > lob else 0.5
+    room = lambda d: 0.5 if d is None else _clamp(d / (1.5 * atr), 0.0, 1.0)
+    votes = {                                              # name: (weight, vote -1..+1)
+        "ema": (14, _clamp((0.6 if e9 > e21 else -0.6) + (0.2 if price > e21 else -0.2) + (0.2 if e21 > e50 else -0.2))),
+        "rsi": (10, _clamp((r - 50) / 15 + (0.2 if r > rp else -0.2))),
+        "macd": (12, (0.5 if h > 0 else -0.5) + (0.5 if h > hp else -0.5)),
+        "stoch": (8, _clamp((0.7 if kk > dd else -0.7) + (0.3 if kk > 50 else -0.3))),
+        "adx": (14, (1.0 if pdi > ndi else -1.0) * min(1.0, adx / 30) if adx >= 18 else 0.0),
+        "supertrend": (12, float(sup)),
+        "boll": (6, _clamp((pb - 0.5) * 2)),
+        "sr": (6, _clamp(room(sr[0]) - room(sr[1]))),
+        "candle": (8, _pattern(candles)),
+        "tf5": (10, v5),
+    }
+    net = sum(w * v for w, v in votes.values())
+    side = 1 if net >= 0 else -1
+    strength = abs(net)
+    agree = sum(1 for w, v in votes.values() if v * side > 0.25)
+    last, rdist, sdist = candles[-1], sr[0], sr[1]
+    body_last = abs(last["c"] - last["o"])
+    flat = atr / price < 2e-5
+    blocked = (
+        flat or adx < 18 or agree < 6 or v5 * side < 0
+        or (side == 1 and r > 78) or (side == -1 and r < 22)
+        or (side == 1 and rdist is not None and rdist < 0.5 * atr)
+        or (side == -1 and sdist is not None and sdist < 0.5 * atr)
+        or (body_last > 1.5 * atr and (last["c"] > last["o"]) != (side == 1)))
+    ok = (not blocked) and strength >= CFG["min_score"]
+    items = []
+    if votes["ema"][1] * side > 0:
+        items.append("EMA 9 above EMA 21" if side == 1 else "EMA 9 below EMA 21")
+    if votes["macd"][1] * side > 0:
+        items.append("MACD rising" if side == 1 else "MACD falling")
+    items.append(f"RSI {r:.0f}")
+    if votes["adx"][1] * side > 0:
+        items.append(f"ADX {adx:.0f}")
+    if votes["supertrend"][1] * side > 0:
+        items.append("Supertrend up" if side == 1 else "Supertrend down")
+    if votes["tf5"][1] * side > 0:
+        items.append("5M trend up" if side == 1 else "5M trend down")
+    return {"score": (side * (5 if strength >= 88 else 4)) if ok else 0, "direction": "CALL" if side == 1 else "PUT",
+            "flat": flat, "analysis": "SHORT: " + ", ".join(items), "strength": round(strength)}
+
+
+async def td_candles(symbol, interval, give_up_at=None):
+    """Same as run.td_candles but 300 candles (still ONE credit) so the 5M trend can be built from the 1M data."""
+    await run.LIMITER.acquire(give_up_at)
+    resp = await run._http().get("https://api.twelvedata.com/time_series", params={
+        "symbol": symbol, "interval": interval, "outputsize": 300, "timezone": "UTC", "apikey": run.TD_KEY})
+    data = resp.json()
+    if data.get("status") == "error" or "values" not in data:
+        code = data.get("code")
+        if code == 429:
+            daily = "day" in str(data.get("message", "")).lower()
+            run.LIMITER.penalize(daily=daily)
+            raise run.RateLimited("daily budget" if daily else "per-minute limit")
+        raise RuntimeError(f"Twelve Data error code {code}")
+    return [{"t": datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+             "o": float(v["open"]), "h": float(v["high"]), "l": float(v["low"]), "c": float(v["close"])}
+            for v in reversed(data["values"])]
+
+
+_o_safe_check = run.safe_check
+
+
+async def safe_check(app, pair, tf, *a, **k):
+    setup, note = await _o_safe_check(app, pair, tf, *a, **k)
+    if "error code 4" in note and "error code 429" not in note:      # symbol not available on this plan: stop asking for a day
+        app.bot_data.setdefault("closed_until", {})[pair] = run._now() + 86400
+    return setup, note
+
+
+async def rotate_loop(app):
+    """More pairs than API requests per minute: start each minute with the next batch so every pair gets scanned."""
+    while True:
+        await asyncio.sleep(60 - (time.time() % 60) + 20)
+        n = min(run.TD_RPM, len(run.PAIRS))
+        if len(run.PAIRS) > n:
+            run.PAIRS[:] = run.PAIRS[n:] + run.PAIRS[:n]
+
+
+run.evaluate, run.td_candles, run.safe_check = strong_evaluate, td_candles, safe_check
+run.TIMEFRAMES[:] = ["1min"]                       # only 2-minute signals (1M candles)
+run.EXPIRY["1min"], run.MIN_SCORE_TF["1min"], run.REQUIRE_ALIGN = 2, 4, False
+
+
 # ----------------------------- hooks into the bot -----------------------------
 async def master_boot(app):
     while app.bot_data.get("store") is None or not app.running:
         await asyncio.sleep(2)
     await cfg_load(app)
     apply_saved()
+    if CFG.get("migr") != 3:                       # one time: every pair, 3-minute cooldown (old saved values: 20 pairs, 50 min)
+        CFG["vals"]["pairs"], CFG["vals"]["cool1"], CFG["migr"] = list(ALL_PAIRS), 3, 3
+        SETTINGS["pairs"][3](CFG["vals"]["pairs"])
+        SETTINGS["cool1"][3](3)
+        await cfg_save(app)
+    app.bot_data["rotate_task"] = asyncio.get_running_loop().create_task(run._forever("rotate", rotate_loop, app))
     app.bot_data["master_task"] = asyncio.get_running_loop().create_task(run._forever("promo", promo_loop, app))
     log.info("master upgrade ready | channel %s | promo %s every %sh",
              CFG["channel_id"] or "none", "ON" if CFG["promo_on"] else "OFF", CFG["promo_hours"])
