@@ -141,8 +141,7 @@ def v_url(s):
 
 ALL_PAIRS = ("EUR/USD GBP/USD USD/JPY USD/CHF USD/CAD AUD/USD NZD/USD EUR/GBP EUR/JPY EUR/CHF EUR/CAD EUR/AUD EUR/NZD "
              "GBP/JPY GBP/CHF GBP/CAD GBP/AUD GBP/NZD AUD/JPY AUD/CHF AUD/CAD AUD/NZD CAD/JPY CAD/CHF CHF/JPY NZD/JPY NZD/CAD "
-             "NZD/CHF USD/MXN USD/ZAR USD/BRL USD/INR USD/TRY USD/SGD USD/HKD USD/NOK USD/SEK USD/PLN "
-             "BTC/USD ETH/USD LTC/USD XRP/USD SOL/USD ADA/USD BNB/USD DOT/USD XAU/USD XAG/USD").split()
+             "NZD/CHF").split()          # the 28 core forex pairs; exotic / crypto / metals only if you add them yourself
 
 
 def v_pairs(s):
@@ -1223,10 +1222,12 @@ async def master_boot(app):
         await asyncio.sleep(2)
     await cfg_load(app)
     apply_saved()
-    if CFG.get("migr") != 3:                       # one time: every pair, 3-minute cooldown (old saved values: 20 pairs, 50 min)
-        CFG["vals"]["pairs"], CFG["vals"]["cool1"], CFG["migr"] = list(ALL_PAIRS), 3, 3
+    if CFG.get("migr") != 4:                       # one time: only the 28 core forex pairs (earlier lists had pairs Quotex does not have)
+        if not CFG.get("migr"):
+            CFG["vals"]["cool1"] = 3
+            SETTINGS["cool1"][3](3)
+        CFG["vals"]["pairs"], CFG["migr"] = list(ALL_PAIRS), 4
         SETTINGS["pairs"][3](CFG["vals"]["pairs"])
-        SETTINGS["cool1"][3](3)
         await cfg_save(app)
     app.bot_data["rotate_task"] = asyncio.get_running_loop().create_task(run._forever("rotate", rotate_loop, app))
     app.bot_data["master_task"] = asyncio.get_running_loop().create_task(run._forever("promo", promo_loop, app))
