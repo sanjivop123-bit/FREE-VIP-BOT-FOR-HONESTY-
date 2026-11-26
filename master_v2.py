@@ -61,7 +61,7 @@ CFG = {"channel_id": None, "channel_title": "", "auto_forward": True, "last_forw
        "promo_on": True, "promo_hours": 5.0, "promo_text": DEFAULT_PROMO, "last_promo": 0.0,
        "referral": "https://broker-qx.pro/sign-up/?lid=2432286",
        "header": "❤️‍🔥 HONESTY TAMIL",
-       "disclaimer": "", "strict": True, "min_deposit": 40, "min_score": 70, "vals": {}}
+       "disclaimer": "", "strict": True, "min_deposit": 40, "min_score": 55, "volume": 3, "vals": {}}
 
 
 # ----------------------------- persistence -----------------------------
@@ -181,7 +181,7 @@ def _setlist(lst):
 # key: (label, kind, getter, setter, validator)    kind: val | text | bool
 SETTINGS = {
     "header": ("Signal header", "text", lambda: CFG["header"], _setkey(CFG, "header"), v_text(60)),
-    "min_score": ("Min analysis score (50-95)", "val", lambda: CFG["min_score"], _setkey(CFG, "min_score"), v_int(50, 95)),
+    "volume": ("Signal volume: 1 strong, 2 balanced, 3 many", "val", lambda: CFG["volume"], _setkey(CFG, "volume"), v_int(1, 3)),
     "pairs": ("Regular pairs (send ALL for the 28 core pairs)", "val", lambda: ",".join(run.PAIRS), _setlist(run.PAIRS), v_pairs),
     "cool1": ("Cooldown per pair (min)", "val", lambda: run.COOLDOWN_MIN["1min"], _setkey(run.COOLDOWN_MIN, "1min"), v_int(0, 240)),
     "auto_forward": ("Auto-forward signals to channel", "bool", lambda: CFG["auto_forward"], _setkey(CFG, "auto_forward"), None),
@@ -431,7 +431,7 @@ async def render(app, key):
         return ("🧠 ANALYSIS SETTINGS\n2-minute signals only. Checked on every closed candle: EMA 9/21/50, RSI, MACD, "
                 "Stochastic, ADX/DI, Supertrend, Bollinger, support/resistance, candle patterns, 5M trend.\n"
                 "A signal is sent only when the weighted score reaches the minimum and the 5M trend agrees."), \
-            kb(edit_rows(["min_score"]) + [BACK])
+            kb(edit_rows(["volume"]) + [BACK])
     if key == "assets":
         return (f"📊 ASSETS\nRegular pairs ({len(run.PAIRS)}): {', '.join(run.PAIRS)}\nOTC: {', '.join(otc_label(x) for x in OTC['symbols']) or OTC['status']}\n"
                 "Signals: 2 minutes (1M candles)\nRegular pairs: Twelve Data. OTC pairs: OTCharts (needs a paid plan)."), kb(edit_rows(["pairs"]) + [BACK])
@@ -783,12 +783,11 @@ def _usd_min(x):
 
 
 def menu_kb():
-    return KB([[B("▶️ Start Signals", callback_data="sig:start"), B("🔕 Stop Signals", callback_data="sig:stop")]])
+    return KB([[B("🔕 Stop Signals", callback_data="sig:stop")]])        # members never get a Start button
 
 
 async def send_connected(app, uid):
     """Connected message + Start/Stop buttons. Signals begin when the member taps Start Signals."""
-    await run.set_optout(app, uid, True)
     vip = app.bot_data["settings"].vip_link
     await app.bot.send_message(uid, CONNECTED + (f"\nVIP access: {vip}" if vip else ""), reply_markup=menu_kb())
 
@@ -851,7 +850,6 @@ async def on_decision_wrap(update, context):
             row = await context.application.bot_data["store"].get_by_trader(q.data.split(":", 1)[1])
             at = row.get("decided_at") if row else None
             if row and row["status"] == "approved" and at and (datetime.now(timezone.utc) - at).total_seconds() < 20:
-                await run.set_optout(context.application, row["telegram_id"], True)
                 await context.bot.send_message(row["telegram_id"], "🔔 SIGNALS", reply_markup=menu_kb())
     except Exception as exc:  # noqa: BLE001
         log.warning("approve menu failed: %s", type(exc).__name__)
@@ -878,6 +876,20 @@ def _ref_markup(rm):
     return KB([[B(b.text, url=_ref(b.url)) if getattr(b, "url", None) else b for b in r] for r in rows])
 
 
+def _members_no_start(chat_id, rm):
+    rows = getattr(rm, "inline_keyboard", None)
+    if not rows or not any(getattr(b, "callback_data", None) == "sig:start" for r in rows for b in r):
+        return rm
+    try:
+        if _APP is not None and _APP.bot_data["settings"].is_admin(chat_id, chat_id):
+            return rm
+    except Exception:  # noqa: BLE001
+        pass
+    keep = [[b for b in r if getattr(b, "callback_data", None) != "sig:start"] for r in rows]
+    keep = [r for r in keep if r]
+    return KB(keep) if keep else None
+
+
 def _unset(v):
     return v is None or type(v).__name__ == "DefaultValue"
 
@@ -894,7 +906,7 @@ async def _bold_message(self, *a, **k):
             text = _ref(text)
             a = (a[0], text) + tuple(a[2:])
     if "reply_markup" in k:
-        k["reply_markup"] = _ref_markup(k["reply_markup"])
+        k["reply_markup"] = _members_no_start(k.get("chat_id", a[0] if a else None), _ref_markup(k["reply_markup"]))
     if isinstance(text, str) and text and _unset(k.get("parse_mode")) and len(a) < 3 and not k.get("entities"):
         wrapped = "<b>" + html.escape(text) + "</b>"
         if "text" in k:
@@ -909,7 +921,7 @@ async def _bold_photo(self, *a, **k):
     if isinstance(k.get("caption"), str):
         k["caption"] = _ref(k["caption"])
     if "reply_markup" in k:
-        k["reply_markup"] = _ref_markup(k["reply_markup"])
+        k["reply_markup"] = _members_no_start(k.get("chat_id", a[0] if a else None), _ref_markup(k["reply_markup"]))
     cap = k.get("caption")
     if isinstance(cap, str) and cap and _unset(k.get("parse_mode")) and not k.get("caption_entities"):
         k["caption"], k["parse_mode"] = "<b>" + html.escape(cap) + "</b>", "HTML"
@@ -1151,6 +1163,9 @@ _CUR = contextvars.ContextVar("cur_pair", default=None)
 _APP = None
 
 
+_LEVELS = {1: (62, 18, 6), 2: (50, 13, 5), 3: (38, 9, 4)}      # volume -> (min score, min ADX, min agreeing checks)
+
+
 def strong_evaluate(candles):
     """Weighted vote of 10 independent checks (0-100). Returns the same dict shape as run.evaluate():
     score = +-5 / +-4 when strong enough, 0 when rejected."""
@@ -1170,6 +1185,7 @@ def strong_evaluate(candles):
     k5 = [x["c"] for x in c5]
     t5 = run._ema(k5, 9)[-1], run._ema(k5, 21)[-1], k5[-1]
     v5 = 1.0 if (t5[0] > t5[1] and t5[2] > t5[1]) else -1.0 if (t5[0] < t5[1] and t5[2] < t5[1]) else 0.0
+    ms, madx, mag = _LEVELS.get(CFG.get("volume", 3), _LEVELS[3])
     adx, pdi, ndi = ad
     kk, dd = st
     mid, upb, lob = bb
@@ -1180,7 +1196,7 @@ def strong_evaluate(candles):
         "rsi": (10, _clamp((r - 50) / 15 + (0.2 if r > rp else -0.2))),
         "macd": (12, (0.5 if h > 0 else -0.5) + (0.5 if h > hp else -0.5)),
         "stoch": (8, _clamp((0.7 if kk > dd else -0.7) + (0.3 if kk > 50 else -0.3))),
-        "adx": (14, (1.0 if pdi > ndi else -1.0) * min(1.0, adx / 30) if adx >= 18 else 0.0),
+        "adx": (14, (1.0 if pdi > ndi else -1.0) * min(1.0, adx / 30) if adx >= madx else 0.0),
         "supertrend": (12, float(sup)),
         "boll": (6, _clamp((pb - 0.5) * 2)),
         "sr": (6, _clamp(room(sr[0]) - room(sr[1]))),
@@ -1195,12 +1211,12 @@ def strong_evaluate(candles):
     body_last = abs(last["c"] - last["o"])
     flat = atr / price < 2e-5
     blocked = (
-        flat or adx < 18 or agree < 6 or v5 * side < 0
+        flat or adx < madx or agree < mag or (v5 * side < 0 and strength < 75)
         or (side == 1 and r > 78) or (side == -1 and r < 22)
         or (side == 1 and rdist is not None and rdist < 0.5 * atr)
         or (side == -1 and sdist is not None and sdist < 0.5 * atr)
         or (body_last > 1.5 * atr and (last["c"] > last["o"]) != (side == 1)))
-    ok = (not blocked) and strength >= CFG["min_score"]
+    ok = (not blocked) and strength >= ms
     items = []
     if votes["ema"][1] * side > 0:
         items.append("EMA 9 above EMA 21" if side == 1 else "EMA 9 below EMA 21")
@@ -1239,6 +1255,30 @@ async def td_candles(symbol, interval, give_up_at=None):
             for v in reversed(data["values"])]
 
 
+_o_set_engine = run.set_engine
+
+
+async def set_engine(app, on):
+    """Only the admin reaches this. Start = every approved member receives signals again."""
+    res = await _o_set_engine(app, on)
+    if on:
+        try:
+            for uid in list(await run.optouts(app)):
+                await run.set_optout(app, uid, False)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not reset member stops: %s", type(exc).__name__)
+    return res
+
+
+async def block_member_start(update, context):
+    if adm(update, context):
+        return                                       # admin: the original handler runs
+    q = update.callback_query
+    if q:
+        await q.answer("Signals are started by the admin.", show_alert=True)
+    raise ApplicationHandlerStop
+
+
 _o_safe_check = run.safe_check
 
 
@@ -1269,7 +1309,7 @@ async def rotate_loop(app):
         run.PAIRS[:] = hot + pick + [p for p in rest if p not in pick]
 
 
-run.evaluate, run.td_candles, run.safe_check = strong_evaluate, td_candles, safe_check
+run.evaluate, run.td_candles, run.safe_check, run.set_engine = strong_evaluate, td_candles, safe_check, set_engine
 run.TIMEFRAMES[:] = ["1min"]                       # only 2-minute signals (1M candles)
 run.EXPIRY["1min"], run.MIN_SCORE_TF["1min"], run.REQUIRE_ALIGN = 2, 4, False
 
@@ -1524,6 +1564,9 @@ async def master_boot(app):
     if CFG.get("migr_ref") != 1:                   # one time: old referral link saved in the database -> new link
         CFG["referral"], CFG["migr_ref"] = NEW_REF, 1
         await cfg_save(app)
+    if CFG.get("score_v") != 1:                    # one time: the old saved score (70) gave too few signals
+        CFG["min_score"], CFG["score_v"] = 55, 1
+        await cfg_save(app)
     if CFG.get("pairs_v") != 6:                    # one time: Twelve Data is on again -> the 28 core forex pairs
         CFG["vals"]["pairs"], CFG["pairs_v"] = list(ALL_PAIRS), 6
         SETTINGS["pairs"][3](CFG["vals"]["pairs"])
@@ -1545,6 +1588,8 @@ def _build(settings, polling):
     _APP = app
     private = filters.ChatType.PRIVATE
     app.add_handler(CommandHandler("autosignal", mark_manual), group=-1)
+    app.add_handler(CallbackQueryHandler(block_member_start, pattern=r"^sig:start$"), group=-1)
+    app.add_handler(CommandHandler("startsignals", block_member_start), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & private, on_text), group=-1)
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
     app.add_handler(CallbackQueryHandler(on_edit, pattern=r"^e:"))
