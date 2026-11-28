@@ -337,7 +337,17 @@ def build_caption(pair, tf, res, entry_ts, aligned=False, test=False):
         f"📊 Asset: {f['Asset']}", f"🕐 Entry Time: {f['Entry Time'].replace(' IST', '').strip()}",
         f"⏳ Expiry: {f['Expiry']}", f"🎯 Signal: {f['Signal']}",
         f"🧠 AI Analysis: {_short_analysis(f.get('Analysis', ''))}"]
+    if not test:
+        t0 = entry_ts if isinstance(entry_ts, (int, float)) else entry_ts.timestamp()
+        key = (pair, int(t0), res["direction"])
+        if key not in _PENDING_KEYS:
+            _PENDING_KEYS.add(key)
+            PENDING.append({"pair": pair, "dir": res["direction"], "t0": int(t0) - int(t0) % 60,
+                            "exp": int(run.EXPIRY.get(tf, 2)), "born": time.time()})
     return "<b>" + html.escape("\n".join(lines)) + "</b>"
+
+
+PENDING, _PENDING_KEYS = [], set()               # signals waiting for their result
 
 
 run.send_signal = send_signal
@@ -406,7 +416,7 @@ MENU = [("📡 Forward Channel", "fwd"), ("⚙️ Signal Engine", "eng"), ("🧠
         ("📊 Asset Management", "assets"), ("✏️ Edit Bot Settings", "edit"), ("📢 Channel Promotion", "promo"),
         ("⏱️ Auto Message Settings", "promo"), ("📈 Signal Statistics", "stats"), ("👥 User Management", "users"),
         ("🔄 Restart Engine", "restart"), ("🟢 Start Engine", "start"), ("🔴 Stop Engine", "stop"),
-        ("📋 System Status", "status")]
+        ("📊 Win/Loss Result", "result"), ("📋 System Status", "status")]
 
 
 def edit_rows(keys):
@@ -445,6 +455,8 @@ async def render(app, key):
             [(f"Interval: {show('promo_hours')} h", "e:promo_hours")],
             [("✏️ Edit message", "e:promo_text"), ("🔗 Edit referral", "e:referral")],
             [("📤 Send now", "p:now")], BACK])
+    if key == "result":
+        return await results_text(app, app.bot_data.get("rs_hours", 24)), result_kb()
     if key == "stats":
         return await stats_text(app), kb([BACK])
     if key == "users":
@@ -1250,9 +1262,14 @@ async def td_candles(symbol, interval, give_up_at=None):
             run.LIMITER.penalize(daily=daily)
             raise run.RateLimited("daily budget" if daily else "per-minute limit")
         raise RuntimeError(f"Twelve Data error code {code}")
-    return [{"t": datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
-             "o": float(v["open"]), "h": float(v["high"]), "l": float(v["low"]), "c": float(v["close"])}
-            for v in reversed(data["values"])]
+    out = [{"t": datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc),
+            "o": float(v["open"]), "h": float(v["high"]), "l": float(v["low"]), "c": float(v["close"])}
+           for v in reversed(data["values"])]
+    try:
+        await settle_pair(symbol, out)               # same candles: settles this pair's finished signals, no extra request
+    except Exception as exc:  # noqa: BLE001
+        log.warning("result settle failed: %s", type(exc).__name__)
+    return out
 
 
 _o_set_engine = run.set_engine
@@ -1555,7 +1572,120 @@ async def status_all(app):
     return await _orig_status_all(app) + otc_status_text()
 
 
+# ----------------------------- win / loss result message (estimated from the market candles) -----------------------------
+async def ensure_outcomes(pool):
+    await pool.execute("CREATE TABLE IF NOT EXISTS master_outcomes (k TEXT PRIMARY KEY, pair TEXT, r TEXT, ts BIGINT)")
+
+
+async def settle_pair(pair, candles):
+    """CALL wins if the price at expiry is above the entry price, PUT if below, equal = draw (not counted)."""
+    if not PENDING or _APP is None:
+        return
+    by = {int(c["t"].timestamp()): c for c in candles}
+    now = time.time()
+    for sig in [x for x in PENDING if x["pair"] == pair]:
+        last_open = sig["t0"] + (sig["exp"] - 1) * 60
+        if last_open + 60 > now:
+            continue                                   # trade not finished yet
+        a, z = by.get(sig["t0"]), by.get(last_open)
+        if a is None or z is None:
+            if now - sig["born"] > 4 * 3600:
+                PENDING.remove(sig)                    # data for it never arrived: forget it, never guess
+            continue
+        PENDING.remove(sig)
+        if z["c"] == a["o"]:
+            continue
+        won = (z["c"] > a["o"]) if sig["dir"] == "CALL" else (z["c"] < a["o"])
+        pool = run._pool(_APP)
+        if pool is not None:
+            await ensure_outcomes(pool)
+            await pool.execute("INSERT INTO master_outcomes (k, pair, r, ts) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                               f"{pair}|{sig['t0']}|{sig['dir']}", pair, "W" if won else "L", sig["t0"])
+
+
+def _verdict(w, l):
+    return "Profit ✅" if w > l else ("Loss ❌" if l > w else "Even ➖")
+
+
+async def results_text(app, hours=24):
+    pool = run._pool(app)
+    if pool is None:
+        return "Results need PostgreSQL (DATABASE_URL)."
+    await ensure_outcomes(pool)
+    rows = await pool.fetch("SELECT pair, r, count(*) AS c FROM master_outcomes WHERE ts >= $1 GROUP BY pair, r",
+                            int(time.time()) - int(hours * 3600))
+    per = {}
+    for r in rows:
+        per.setdefault(r["pair"], {"W": 0, "L": 0})[r["r"]] = r["c"]
+    if not per:
+        return "📅 No finished signals yet. Results appear a few minutes after each signal ends."
+    W, L = sum(v["W"] for v in per.values()), sum(v["L"] for v in per.values())
+    lines = [f"📅 LAST {hours:g} HOURS {_verdict(W, L)}", "", f"Win: {W}  |  Loss: {L}", ""]
+    for pair, v in sorted(per.items(), key=lambda kv: -(kv[1]["W"] + kv[1]["L"]))[:12]:
+        lines.append(f"{pair} {_verdict(v['W'], v['L'])}  Win: {v['W']} | Loss: {v['L']}")
+    lines += ["", "(estimated from market candles; your broker's price can differ slightly)"]
+    return "\n".join(lines)
+
+
+def result_kb():
+    return kb([[("📤 Send to users", "rs:users"), ("📤 Send to channel", "rs:chan")], [("🔄 Refresh", "rs:ref")]])
+
+
+async def result_cmd(update, context):
+    if not adm(update, context):
+        return
+    try:
+        hours = float(context.args[0]) if context.args else 24
+    except ValueError:
+        hours = 24
+    context.application.bot_data["rs_hours"] = max(1, min(hours, 720))
+    await update.effective_message.reply_text(await results_text(context.application, context.application.bot_data["rs_hours"]),
+                                              reply_markup=result_kb())
+    raise ApplicationHandlerStop
+
+
+async def on_result_btn(update, context):
+    q, app = update.callback_query, context.application
+    if not adm(update, context):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    act, hours = q.data.split(":", 1)[1], app.bot_data.get("rs_hours", 24)
+    text = await results_text(app, hours)
+    if act == "ref":
+        await q.answer("Refreshed")
+        await edit_msg(q, text, result_kb())
+        return
+    if act == "chan":
+        if not CFG["channel_id"]:
+            await q.answer("No channel connected.", show_alert=True)
+            return
+        ids = [CFG["channel_id"]]
+    else:
+        approved = set(await app.bot_data["store"].list_approved_ids())
+        ids = sorted((approved | set(app.bot_data["settings"].admin_ids)) - await run.optouts(app))
+    sent = 0
+    for uid in ids:
+        try:
+            await app.bot.send_message(uid, text)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("result not delivered to %s: %s", uid, type(exc).__name__)
+        await asyncio.sleep(0.05)
+    await q.answer(f"Sent to {sent}/{len(ids)}", show_alert=True)
+
+
 # ----------------------------- hooks into the bot -----------------------------
+async def force_off_at_boot(app):
+    """Only the admin starts the engine: after every start / restart / wake-up it begins STOPPED."""
+    await asyncio.sleep(12)
+    try:
+        if run.engine_on(app):
+            await _o_set_engine(app, False)
+            log.info("engine forced OFF after boot: the admin must press Start")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not force the engine off: %s", type(exc).__name__)
+
+
 async def master_boot(app):
     while app.bot_data.get("store") is None or not app.running:
         await asyncio.sleep(2)
@@ -1572,6 +1702,7 @@ async def master_boot(app):
         SETTINGS["pairs"][3](CFG["vals"]["pairs"])
         await cfg_save(app)
     app.bot_data["otc_boot"] = asyncio.get_running_loop().create_task(otc_boot(app))     # OTC data: stream + paced REST
+    asyncio.get_running_loop().create_task(force_off_at_boot(app))
     app.bot_data["rotate_task"] = asyncio.get_running_loop().create_task(run._forever("rotate", rotate_loop, app))
     app.bot_data["master_task"] = asyncio.get_running_loop().create_task(run._forever("promo", promo_loop, app))
     log.info("master upgrade ready | channel %s | promo %s every %sh",
@@ -1599,6 +1730,8 @@ def _build(settings, polling):
     app.add_handler(CallbackQueryHandler(on_result, pattern=r"^r:"))
     app.add_handler(CallbackQueryHandler(on_del, pattern=r"^d:"))
     app.add_handler(CallbackQueryHandler(on_trader, pattern=r"^tr:"))
+    app.add_handler(CallbackQueryHandler(on_result_btn, pattern=r"^rs:"))
+    app.add_handler(CommandHandler("result", result_cmd), group=-1)
     app.add_handler(CallbackQueryHandler(on_decision_wrap, pattern=r"^(ok|no):.{1,60}$"), group=-1)
     app.add_handler(CommandHandler("trader", cmd_trader), group=-1)   # replaces the old one-ID-only /trader for admins
     for name, fn in [("admin", panel_cmd("home")), ("edit", panel_cmd("edit")), ("forwardchannel", panel_cmd("fwd")),
